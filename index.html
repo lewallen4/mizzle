@@ -309,7 +309,7 @@ footer a { color: inherit; }
 const LAT = 47.6062, LON = -122.3321;
 const API = "https://api.open-meteo.com/v1/forecast?" + [
   "latitude=" + LAT, "longitude=" + LON,
-  "current=temperature_2m,apparent_temperature,relative_humidity_2m,dew_point_2m,precipitation,weather_code,cloud_cover,wind_speed_10m,wind_direction_10m,wind_gusts_10m,is_day",
+  "current=temperature_2m,apparent_temperature,relative_humidity_2m,precipitation,weather_code,cloud_cover,wind_speed_10m,wind_direction_10m,wind_gusts_10m,is_day",
   "hourly=temperature_2m,precipitation_probability,precipitation,weather_code",
   "daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max,precipitation_sum,sunrise,sunset,daylight_duration,uv_index_max",
   "temperature_unit=fahrenheit", "wind_speed_unit=mph", "precipitation_unit=inch",
@@ -335,7 +335,12 @@ const wmo = c => WMO[c] || ["Unsettled", "cloud", 0];
 const isWet = k => k === "drizzle" || k === "rain" || k === "snow" || k === "thunder";
 
 // All times are kept as "Seattle wall clock" milliseconds: local strings parsed as if UTC.
-const wall = s => Date.parse(s.length === 10 ? s + "T00:00Z" : s + "Z");
+// Parsed by hand rather than Date.parse, so every browser reads them the same way.
+const wall = s => {
+  const m = /^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2}))?)?/.exec(String(s));
+  if (!m) throw new Error("bad time " + s);
+  return Date.UTC(+m[1], +m[2] - 1, +m[3], +(m[4] || 0), +(m[5] || 0), +(m[6] || 0));
+};
 function fmtTime(ms, withMin) {
   const d = new Date(ms); let h = d.getUTCHours(); const m = d.getUTCMinutes();
   const ap = h < 12 ? "AM" : "PM"; h = h % 12 || 12;
@@ -365,6 +370,13 @@ function sunState(nowW, rise, set, nextRise, prevSet) {
   const p = (nowW - from) / (to - from);
   const hrs = Math.min(nowW - from, to - nowW) / 3600000;
   return { up: false, p: Math.max(0, Math.min(1, p)), alt: -Math.min(1, hrs / 2.5) };
+}
+
+// Magnus formula, in Fahrenheit
+function dewPointF(tF, rh) {
+  if (tF == null || !rh) return null;
+  const t = (tF - 32) / 1.8, g = Math.log(rh / 100) + 17.62 * t / (243.12 + t);
+  return 243.12 * g / (17.62 - g) * 1.8 + 32;
 }
 
 function buildModel(d, nowUtc) {
@@ -427,7 +439,7 @@ function buildModel(d, nowUtc) {
   return {
     nowW, temp: c.temperature_2m, feels: c.apparent_temperature, code: c.weather_code, label, kind, intensity,
     tag: TAGS[c.weather_code] || "", isDay: !!c.is_day, cloud: c.cloud_cover, precip: c.precipitation || 0,
-    humidity: c.relative_humidity_2m, dew: c.dew_point_2m, wind: c.wind_speed_10m, gust: c.wind_gusts_10m, windDir: c.wind_direction_10m,
+    humidity: c.relative_humidity_2m, dew: c.dew_point_2m != null ? c.dew_point_2m : dewPointF(c.temperature_2m, c.relative_humidity_2m), wind: c.wind_speed_10m, gust: c.wind_gusts_10m, windDir: c.wind_direction_10m,
     hi: today.hi, lo: today.lo, rainToday: today.sum, uv: today.uv,
     summary, hours, week, wkLo, wkHi, today, tomorrow, sun, deltaSec, moon: moonPhase(nowUtc),
     updatedW: c.time ? wall(c.time) : nowW
@@ -707,16 +719,15 @@ function boot() {
     const tc = $("themeColor"); if (tc) tc.setAttribute("content", sky.topColor());
   }
 
-  function render(m) {
-    model = m;
+  function render(m) { return safeRender(m); }
+
+  function renderHero(m) {
     $("temp").innerHTML = Math.round(m.temp) + "<sup>°F</sup>";
     $("label").textContent = m.label;
     const tag = $("tag"); tag.textContent = m.tag; tag.hidden = !m.tag;
     $("meta").textContent = "Feels like " + Math.round(m.feels) + "°  ·  H " + Math.round(m.hi) + "°  L " + Math.round(m.lo) + "°";
     $("summary").textContent = m.summary;
     $("clock").textContent = DOW[new Date(m.nowW).getUTCDay()] + " " + fmtTime(m.nowW, true);
-    renderHours(m); renderSun(m); renderWeek(m); renderDetails(m);
-    if (previewIdx < 0) setSky(skyFor(m));
   }
 
   function renderHours(m) {
@@ -812,33 +823,73 @@ function boot() {
 
   async function getJSON(url, ms) {
     const ac = new AbortController(); const tm = setTimeout(() => ac.abort(), ms);
-    try { const r = await fetch(url, { signal: ac.signal, cache: "no-store" }); if (!r.ok) throw new Error("HTTP " + r.status); return await r.json(); }
-    finally { clearTimeout(tm); }
+    try {
+      let r;
+      try { r = await fetch(url, { signal: ac.signal }); }
+      catch (e) { throw new Error(e.name === "AbortError" ? "timed out" : "network error: " + (e.message || e.name)); }
+      if (!r.ok) {
+        let why = ""; try { const j = await r.json(); why = j && j.reason ? ": " + j.reason : ""; } catch (e) {}
+        throw new Error("HTTP " + r.status + why);
+      }
+      return await r.json();
+    } finally { clearTimeout(tm); }
+  }
+
+  function shortErr(e) { return String((e && e.message) || e).slice(0, 140); }
+
+  // Draw a model, panel by panel, so one bad panel can't take down the rest.
+  function safeRender(m) {
+    const errs = [];
+    model = m;
+    for (const fn of [renderHero, renderHours, renderSun, renderWeek, renderDetails]) {
+      try { fn(m); } catch (e) { errs.push(fn.name + ": " + shortErr(e)); console.error(e); }
+    }
+    if (previewIdx < 0) { try { setSky(skyFor(m)); } catch (e) { errs.push("sky: " + shortErr(e)); } }
+    return errs;
   }
 
   async function load() {
     const btn = $("refresh"); btn.classList.add("spin");
+    let data = null, fetchErr = null;
     try {
-      const data = await getJSON(API, 10000);
-      if (!data || !data.current || !data.hourly || !data.daily) throw new Error("Unexpected response");
-      lastFetch = Date.now(); source = "live";
-      try { localStorage.setItem("mizzle:last", JSON.stringify({ at: lastFetch, data })); } catch (e) {}
-      lastData = data; render(buildModel(data, Date.now()));
-      notice("");
-      $("updated").textContent = "Updated " + fmtTime(Date.now() + (data.utc_offset_seconds || 0) * 1000, true);
-    } catch (err) {
-      let cached = null;
-      try { cached = JSON.parse(localStorage.getItem("mizzle:last") || "null"); } catch (e) {}
-      if (cached && Date.now() - cached.at < 36 * 3600000) {
-        source = "cache"; lastData = cached.data; render(buildModel(cached.data, Date.now()));
-        notice("Couldn't reach the forecast, so this is from " + ago(cached.at) + ".");
-        $("updated").textContent = "Last good update " + ago(cached.at);
-      } else {
-        source = "sample"; lastData = sampleData(Date.now()); render(buildModel(lastData, Date.now()));
-        notice("Live weather couldn't load here, so you're seeing a sample sky.");
-        $("updated").textContent = "Showing sample data";
+      data = await getJSON(API, 15000);
+      if (!data || !data.current || !data.hourly || !data.daily) throw new Error("unexpected response");
+    } catch (e) { fetchErr = e; data = null; }
+
+    if (data) {
+      let errs;
+      try { errs = safeRender(buildModel(data, Date.now())); }
+      catch (e) { errs = ["model: " + shortErr(e)]; console.error(e); }
+      if (!errs.length) {
+        lastFetch = Date.now(); source = "live"; lastData = data;
+        try { localStorage.setItem("mizzle:last", JSON.stringify({ at: lastFetch, data })); } catch (e) {}
+        notice("");
+        $("updated").textContent = "Updated " + fmtTime(Date.now() + (data.utc_offset_seconds || 0) * 1000, true);
+        btn.classList.remove("spin"); loadAlerts(); return;
       }
-    } finally { btn.classList.remove("spin"); }
+      fetchErr = new Error("got the forecast but couldn't draw it (" + errs.join("; ") + ")");
+    }
+
+    const why = shortErr(fetchErr);
+    let cached = null;
+    try { cached = JSON.parse(localStorage.getItem("mizzle:last") || "null"); } catch (e) {}
+    let shown = false;
+    if (cached && cached.data && Date.now() - cached.at < 36 * 3600000) {
+      try {
+        if (!safeRender(buildModel(cached.data, Date.now())).length) {
+          source = "cache"; lastData = cached.data; shown = true;
+          notice("Couldn't refresh (" + why + "), so this is from " + ago(cached.at) + ".");
+          $("updated").textContent = "Last good update " + ago(cached.at);
+        }
+      } catch (e) {}
+    }
+    if (!shown) {
+      source = "sample"; lastData = sampleData(Date.now());
+      try { safeRender(buildModel(lastData, Date.now())); } catch (e) {}
+      notice("Live weather couldn't load (" + why + "), so you're seeing a sample sky.");
+      $("updated").textContent = "Showing sample data";
+    }
+    btn.classList.remove("spin");
     loadAlerts();
   }
 
